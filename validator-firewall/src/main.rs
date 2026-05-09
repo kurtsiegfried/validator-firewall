@@ -138,14 +138,15 @@ async fn main() -> Result<(), anyhow::Error> {
         .context("eBPF program 'validator_firewall' missing from object")?
         .try_into()?;
     program.load()?;
-    // Try native XDP first; fall back to SKB mode on EINVAL. Native is
-    // refused by some drivers when the interface has jumbo MTU or when the
-    // driver lacks a native XDP path (mlx5_core with MTU 9000 + multi-buffer
-    // XDP not enabled is a common case). SKB mode runs the same program
-    // after packet→skb conversion, so the matching logic is identical.
-    if let Err(native_err) = program.attach(&config.iface, XdpFlags::default()) {
+    // Prefer native (driver) XDP — orders of magnitude better pps than SKB
+    // mode. The eBPF program is declared `#[xdp(frags)]` so multi-buffer-
+    // capable drivers (mlx5_core, ice, i40e, …) accept it on jumbo-frame
+    // interfaces. SKB mode is kept as a defense-in-depth fallback for
+    // interfaces whose driver lacks a native XDP path at all (e.g. r8169).
+    if let Err(native_err) = program.attach(&config.iface, XdpFlags::DRV_MODE) {
         warn!(
-            "native XDP attach on {} failed ({}); retrying in SKB mode",
+            "native XDP attach on {} failed ({}); falling back to SKB mode \
+             (significant pps loss — investigate driver/MTU)",
             &config.iface, native_err
         );
         program
@@ -153,7 +154,7 @@ async fn main() -> Result<(), anyhow::Error> {
             .context("XDP attach failed in both native and SKB mode")?;
         info!("XDP attached on {} in SKB mode", &config.iface);
     } else {
-        info!("XDP attached on {} in native mode", &config.iface);
+        info!("XDP attached on {} in native (driver) mode", &config.iface);
     }
 
     info!("Filtering UDP ports: {:?}", protected_ports);

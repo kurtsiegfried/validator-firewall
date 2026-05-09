@@ -56,7 +56,13 @@ static PROTECTED_PORTS: HashMap<u16, u8> = HashMap::<u16, u8>::with_max_entries(
 #[map(name = "hvf_cnc")]
 static CNC: Array<RuntimeControls> = Array::<RuntimeControls>::with_max_entries(1, 0);
 
-#[xdp]
+// `frags` declares this program as multi-buffer-XDP-aware: the kernel sets
+// BPF_F_XDP_HAS_FRAGS on load and the driver allows native attach on
+// jumbo-frame interfaces (MTU > ~3520, where a packet may span multiple page
+// fragments). We only ever read the first 42 bytes (Eth+IPv4+UDP), which the
+// driver is required to place in the linear part, so the match logic needs
+// no helper changes.
+#[xdp(frags)]
 pub fn validator_firewall(ctx: XdpContext) -> u32 {
     let cnc = match CNC.get(0) {
         Some(cnc) => cnc,
