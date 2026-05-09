@@ -90,6 +90,10 @@ impl DenyListClient for DuckDbDenyListClient {
             let mut rows = stmt.query(params![]).context("duckdb query failed")?;
             let mut deny_list = Vec::new();
             while let Some(row) = rows.next().context("duckdb row fetch failed")? {
+                // Column 0 must be a u32 such that `Ipv4Addr::from(u32)`
+                // produces the intended host — i.e. 1.2.3.4 == 0x01020304.
+                // DuckDB INTEGER columns round-trip naturally; if you're
+                // aliasing from inet semantics, cast explicitly in the query.
                 let ip: u32 = row.get(0).context("duckdb row missing u32 column 0")?;
                 let converted: Ipv4Addr = ip.into();
                 let cidr = Ipv4Cidr::new(converted, 32)

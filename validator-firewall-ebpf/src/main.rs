@@ -20,13 +20,25 @@ use network_types::{
 
 const DENY_LIST_SIZE: u32 = 524288;
 
-//These are our data structures that we use to communicate with userspace
+// BPF maps shared with userspace.
+//
+// Endianness convention for integer keys/values: HOST byte order, on both
+// sides. Concretely, an IPv4 address `1.2.3.4` is stored as the integer
+// `0x01020304_u32`, matching the std `From<u32> for Ipv4Addr` mapping. The
+// eBPF program does the network→host conversion at packet ingest via
+// `u32::from_be_bytes(src_addr)` / `u16::from_be_bytes(udp.dst)`, and the
+// userspace side uses `u32::from(ipv4_addr)` / a `u16` port from clap, which
+// produce the same host-order integer. Do not store wire-order values in
+// these maps — `aya-log`'s `{:i}` formatter and the `Ipv4Addr::from(u32)`
+// renderer both assume host order.
 #[map(name = "hvf_deny_list")]
-static LEADER_SLOT_DENY_LIST: HashMap<u32, u8> = HashMap::<u32, u8>::with_max_entries(DENY_LIST_SIZE, 0);
+static LEADER_SLOT_DENY_LIST: HashMap<u32, u8> =
+    HashMap::<u32, u8>::with_max_entries(DENY_LIST_SIZE, 0);
 #[map(name = "hvf_always_allow")]
 static FULL_SCHEDULE_ALLOW_LIST: HashMap<u32, u8> = HashMap::<u32, u8>::with_max_entries(8192, 0);
 #[map(name = "hvf_stats")]
-static STATS: PerCpuHashMap<u32, ConnectionStats> = PerCpuHashMap::<u32, ConnectionStats>::with_max_entries(16384, 0);
+static STATS: PerCpuHashMap<u32, ConnectionStats> =
+    PerCpuHashMap::<u32, ConnectionStats>::with_max_entries(16384, 0);
 
 #[map(name = "hvf_protected_ports")]
 static PROTECTED_PORTS: HashMap<u16, u8> = HashMap::<u16, u8>::with_max_entries(1024, 0);
