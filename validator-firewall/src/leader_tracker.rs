@@ -3,8 +3,6 @@ use log::{error, info, warn};
 use rangemap::RangeInclusiveSet;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
-use solana_sdk::epoch_info::EpochInfo;
-use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -48,7 +46,7 @@ impl RPCLeaderTracker {
     }
 
     async fn close_to_leader(&self) -> Option<LeaderDistance> {
-        self.leader_status.read().await.clone()
+        *self.leader_status.read().await
     }
     pub async fn run(&self) {
         let mut current_epoch = 0u64;
@@ -58,7 +56,7 @@ impl RPCLeaderTracker {
         while !self.exit_flag.load(Ordering::Relaxed) {
             match tracker_state {
                 LeaderTrackerState::NeedIdentity => {
-                    if let Ok(_) = self.get_identity().await {
+                    if self.get_identity().await.is_ok() {
                         tracker_state = LeaderTrackerState::NeedLeaderSchedule;
                     } else {
                         warn!("Failed to get identity. Retrying in 5 seconds.");
@@ -158,7 +156,7 @@ impl RPCLeaderTracker {
 
     async fn refresh_leader_schedule(&self) -> Result<RangeInclusiveSet<u64, u64>, ()> {
         let my_id = self.get_identity().await?;
-        return match self
+        match self
             .rpc_client
             .get_leader_schedule_with_commitment(
                 None,
@@ -172,30 +170,30 @@ impl RPCLeaderTracker {
                 error!("Failed to get leader schedule: {e}");
                 Err(())
             }
-            Ok(sched) => {
-                if sched.is_none() {
-                    error!("Failed to get leader schedule.");
-                    return Err(());
-                }
-                if let Some(my_slots) = sched.unwrap().get(&my_id) {
+            Ok(None) => {
+                error!("Failed to get leader schedule.");
+                Err(())
+            }
+            Ok(Some(sched)) => {
+                if let Some(my_slots) = sched.get(&my_id) {
                     let mut leader_ranges: RangeInclusiveSet<u64, u64> = RangeInclusiveSet::new();
                     for slot in my_slots {
                         let end: u64 = *slot as u64;
-
                         let range = end.saturating_sub(self.slot_buffer)..=end;
                         leader_ranges.insert(range);
                     }
+                    // Always treat the first 10 slots of the epoch as "close
+                    // to leader" — guards against schedule wraparound at the
+                    // epoch boundary (see commit f73a78d).
                     leader_ranges.insert(0..=10);
-                    // let rngs: Vec<Range<u64>> =leader_ranges.iter().collect();
                     info!("Leader ranges: {leader_ranges:?}");
-
                     Ok(leader_ranges)
                 } else {
                     error!("No slots found for: {my_id}");
                     Err(())
                 }
             }
-        };
+        }
     }
 }
 

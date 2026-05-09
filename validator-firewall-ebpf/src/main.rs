@@ -7,7 +7,7 @@ use aya_ebpf::{
     maps::{Array, HashMap, PerCpuHashMap},
     programs::XdpContext,
 };
-use aya_log_ebpf::{debug, error, warn, info, trace};
+use aya_log_ebpf::{debug, error, warn};
 
 use validator_firewall_common::{RuntimeControls,ConnectionStats,StatType};
 
@@ -123,16 +123,24 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
 
 #[inline(always)]
 fn try_process_packet(ctx: &XdpContext, close_to_leader: bool) -> Result<u32, ()> {
-    let eth_header: *const EthHdr = ptr_at(&ctx, 0)?;
-    if let EtherType::Ipv6 = unsafe { (*eth_header).ether_type } {
+    // network-types 0.2 stores raw u8/u16 fields in network byte order; we
+    // compare against the protocol-enum variants cast to their wire values
+    // (avoids the Result-returning helper which the verifier doesn't like).
+    let eth_header: *const EthHdr = ptr_at(ctx, 0)?;
+    let ether_type = u16::from_be(unsafe { (*eth_header).ether_type });
+    if ether_type == EtherType::Ipv6 as u16 {
+        return Ok(xdp_action::XDP_PASS);
+    }
+    if ether_type != EtherType::Ipv4 as u16 {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    let ipv4_header: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
-    return if let IpProto::Udp = unsafe { (*ipv4_header).proto } {
-        let source_addr = u32::from_be(unsafe { (*ipv4_header).src_addr });
-        let udp_header: *const UdpHdr = ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-        let dest_port = u16::from_be(unsafe { (*udp_header).dest });
+    let ipv4_header: *const Ipv4Hdr = ptr_at(ctx, EthHdr::LEN)?;
+    let proto = unsafe { (*ipv4_header).proto };
+    if proto == IpProto::Udp as u8 {
+        let source_addr = u32::from_be_bytes(unsafe { (*ipv4_header).src_addr });
+        let udp_header: *const UdpHdr = ptr_at(ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
+        let dest_port = u16::from_be_bytes(unsafe { (*udp_header).dst });
         if !is_protected_port(dest_port) {
             return Ok(xdp_action::XDP_PASS);
         }
@@ -167,11 +175,11 @@ fn try_process_packet(ctx: &XdpContext, close_to_leader: bool) -> Result<u32, ()
         Ok(action)
     } else {
         Ok(xdp_action::XDP_PASS)
-    };
+    }
 }
 
-//Placeholder
+//Placeholder — QUIC 0-RTT detection not yet implemented.
 #[inline(always)]
-fn is_quic_zero_rtt(ctx: &XdpContext, source_addr: u32) -> bool {
+fn is_quic_zero_rtt(_ctx: &XdpContext, _source_addr: u32) -> bool {
     false
 }

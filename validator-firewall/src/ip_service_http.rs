@@ -11,7 +11,6 @@ use tower_http::auth::AddAuthorizationLayer;
 use tracing::{debug, info, warn};
 
 pub struct IPState {
-    pub gossip_nodes: Arc<RwLock<HashSet<Ipv4Cidr>>>,
     pub http_nodes: Arc<RwLock<HashSet<Ipv4Cidr>>>,
     pub blocked_nodes: Arc<RwLock<HashSet<Ipv4Cidr>>>,
 }
@@ -19,13 +18,9 @@ pub struct IPState {
 impl IPState {
     pub fn new() -> Self {
         IPState {
-            gossip_nodes: Arc::new(RwLock::new(HashSet::new())),
             http_nodes: Arc::new(RwLock::new(HashSet::new())),
             blocked_nodes: Arc::new(RwLock::new(HashSet::new())),
         }
-    }
-    pub async fn set_gossip_nodes(&self, nodes: HashSet<Ipv4Cidr>) {
-        *self.gossip_nodes.write().await = nodes;
     }
 
     pub async fn add_http_node(&self, node: Ipv4Cidr) {
@@ -51,6 +46,18 @@ impl IPState {
         combined_nodes.retain(|node| !allow_listed.contains(node));
 
         combined_nodes
+    }
+}
+
+/// Returns a redacted form of `token` showing only the first 4 chars.
+/// Tokens shorter than 4 chars are fully redacted to avoid leaking them.
+fn mask_token(token: &str) -> String {
+    const VISIBLE: usize = 4;
+    if token.chars().count() <= VISIBLE {
+        "****".to_string()
+    } else {
+        let prefix: String = token.chars().take(VISIBLE).collect();
+        format!("{prefix}****")
     }
 }
 
@@ -116,8 +123,11 @@ pub fn create_router(state: Arc<IPState>, token: Option<String>) -> Router {
         .route("/", get(get_deny_list))
         .route("/nodes", get(get_deny_list))
         .with_state(state.clone());
-    return if let Some(token) = token {
-        info!("Adding authentication layer with token: {}", token);
+    if let Some(token) = token {
+        info!(
+            "Adding authentication layer with token: {}",
+            mask_token(&token)
+        );
         Router::new()
             .route(
                 "/allowed",
@@ -151,5 +161,27 @@ pub fn create_router(state: Arc<IPState>, token: Option<String>) -> Router {
             )
             .with_state(state.clone())
             .merge(app)
-    };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_token;
+
+    #[test]
+    fn masks_long_tokens_to_first_four_chars() {
+        assert_eq!(mask_token("abcdefghij"), "abcd****");
+    }
+
+    #[test]
+    fn fully_redacts_short_tokens() {
+        assert_eq!(mask_token("abcd"), "****");
+        assert_eq!(mask_token(""), "****");
+    }
+
+    #[test]
+    fn handles_multibyte_chars_safely() {
+        // 4 chars (8 bytes) — borderline, should fully redact rather than slice mid-codepoint.
+        assert_eq!(mask_token("héllo"), "héll****");
+    }
 }

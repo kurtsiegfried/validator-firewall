@@ -15,13 +15,12 @@ use aya::{
     include_bytes_aligned,
     maps::HashMap,
     programs::{Xdp, XdpFlags},
-    Bpf,
+    Ebpf,
 };
-use aya_log::BpfLogger;
+use aya_log::EbpfLogger;
 use cidr::Ipv4Cidr;
 use clap::Parser;
 use log::{debug, error, info, warn};
-use serde::Deserialize;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -48,9 +47,13 @@ struct HVFConfig {
 }
 
 const DENY_LIST_MAP: &str = "hvf_deny_list";
+const ALLOW_LIST_MAP: &str = "hvf_always_allow";
 const PROTECTED_PORTS_MAP: &str = "hvf_protected_ports";
 const CONNECTION_STATS: &str = "hvf_stats";
 const CNC_ARRAY: &str = "hvf_cnc";
+
+// Must match validator-firewall-ebpf hvf_always_allow max_entries.
+const ALLOW_LIST_MAX_ENTRIES: usize = 8192;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -65,7 +68,7 @@ async fn main() -> Result<(), anyhow::Error> {
         // Load static overrides if provided
         if let Some(path) = config.static_overrides {
             let overrides = load_static_overrides(path)?;
-            let denied: HashSet<Ipv4Cidr> = overrides.deny.iter().map(|x| x.ip.clone()).collect();
+            let denied: HashSet<Ipv4Cidr> = overrides.deny.iter().map(|x| x.ip).collect();
             let intersection: Vec<&NameAddressPair> = overrides
                 .allow
                 .iter()
@@ -114,24 +117,28 @@ async fn main() -> Result<(), anyhow::Error> {
     // like to specify the eBPF program at runtime rather than at compile-time, you can
     // reach for `Bpf::load_file` instead.
     #[cfg(debug_assertions)]
-    let mut bpf = Bpf::load(include_bytes_aligned!(
+    let mut bpf = Ebpf::load(include_bytes_aligned!(
         "../../target/bpfel-unknown-none/debug/validator-firewall"
     ))?;
     #[cfg(not(debug_assertions))]
-    let mut bpf = Bpf::load(include_bytes_aligned!(
+    let mut bpf = Ebpf::load(include_bytes_aligned!(
         "../../target/bpfel-unknown-none/release/validator-firewall"
     ))?;
-    if let Err(e) = BpfLogger::init(&mut bpf) {
+    if let Err(e) = EbpfLogger::init(&mut bpf) {
         // This can happen if you remove all log statements from your eBPF program.
         warn!("failed to initialize eBPF logger: {}", e);
     }
-    let program: &mut Xdp = bpf.program_mut("validator_firewall").unwrap().try_into()?;
+    let program: &mut Xdp = bpf
+        .program_mut("validator_firewall")
+        .context("eBPF program 'validator_firewall' missing from object")?
+        .try_into()?;
     program.load()?;
     program.attach(&config.iface, XdpFlags::default())
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
 
     info!("Filtering UDP ports: {:?}", protected_ports);
     push_ports_to_map(&mut bpf, protected_ports)?;
+    push_allow_list_to_map(&mut bpf, &static_overrides.0)?;
 
     let exit = Arc::new(AtomicBool::new(false));
     let gossip_exit = exit.clone();
@@ -145,7 +152,9 @@ async fn main() -> Result<(), anyhow::Error> {
             static_overrides.clone(),
         );
 
-        let map = bpf.take_map(DENY_LIST_MAP).unwrap();
+        let map = bpf
+            .take_map(DENY_LIST_MAP)
+            .context("hvf_deny_list map missing from eBPF object")?;
         let state_updater_handle = tokio::spawn(async move {
             state_updater.run(map).await;
         });
@@ -161,7 +170,9 @@ async fn main() -> Result<(), anyhow::Error> {
             static_overrides.clone(),
         );
 
-        let map = bpf.take_map(DENY_LIST_MAP).unwrap();
+        let map = bpf
+            .take_map(DENY_LIST_MAP)
+            .context("hvf_deny_list map missing from eBPF object")?;
         let gossip_handle = tokio::spawn(async move {
             s_updater.run(map).await;
         });
@@ -177,7 +188,9 @@ async fn main() -> Result<(), anyhow::Error> {
             static_overrides.clone(),
         );
 
-        let map = bpf.take_map(DENY_LIST_MAP).unwrap();
+        let map = bpf
+            .take_map(DENY_LIST_MAP)
+            .context("hvf_deny_list map missing from eBPF object")?;
         let gossip_handle = tokio::spawn(async move {
             s_updater.run(map).await;
         });
@@ -196,16 +209,20 @@ async fn main() -> Result<(), anyhow::Error> {
         bg_tracker.clone().run().await;
     });
 
-    let mut tracker_service =
-        CommandControlService::new(exit.clone(), tracker, bpf.take_map(CNC_ARRAY).unwrap());
+    let cnc_map = bpf
+        .take_map(CNC_ARRAY)
+        .context("hvf_cnc map missing from eBPF object")?;
+    let mut tracker_service = CommandControlService::new(exit.clone(), tracker, cnc_map);
     let tracker_service_handle = tokio::spawn(async move {
         tracker_service.run().await;
     });
 
     //Start the stats service
     let stats_exit = exit.clone();
-    let stats_service =
-        stats_service::StatsService::new(stats_exit, 10, bpf.take_map(CONNECTION_STATS).unwrap());
+    let stats_map = bpf
+        .take_map(CONNECTION_STATS)
+        .context("hvf_stats map missing from eBPF object")?;
+    let stats_service = stats_service::StatsService::new(stats_exit, 10, stats_map);
     let stats_handle = tokio::spawn(async move {
         stats_service.run().await;
     });
@@ -214,23 +231,74 @@ async fn main() -> Result<(), anyhow::Error> {
     signal::ctrl_c().await?;
     exit.store(true, std::sync::atomic::Ordering::SeqCst);
 
-    let (_, _, _, _) = tokio::join!(
+    let results = tokio::join!(
         ip_svc_handle,
         stats_handle,
         tracker_handle,
         tracker_service_handle
     );
+    log_task_join("ip_svc", results.0);
+    log_task_join("stats", results.1);
+    log_task_join("tracker", results.2);
+    log_task_join("tracker_service", results.3);
     info!("Exiting...");
 
     Ok(())
 }
 
-fn push_ports_to_map(bpf: &mut Bpf, ports: Vec<u16>) -> Result<(), anyhow::Error> {
-    let mut protected_ports: HashMap<_, u16, u8> =
-        HashMap::try_from(bpf.map_mut(PROTECTED_PORTS_MAP).unwrap()).unwrap();
-    for port in ports {
-        protected_ports.insert(&port, &0, 0)?;
+fn log_task_join(name: &str, result: Result<(), tokio::task::JoinError>) {
+    if let Err(e) = result {
+        if e.is_panic() {
+            error!("task '{name}' panicked: {e}");
+        } else {
+            warn!("task '{name}' was cancelled: {e}");
+        }
     }
+}
+
+fn push_ports_to_map(bpf: &mut Ebpf, ports: Vec<u16>) -> Result<(), anyhow::Error> {
+    let mut protected_ports: HashMap<_, u16, u8> = HashMap::try_from(
+        bpf.map_mut(PROTECTED_PORTS_MAP)
+            .context("hvf_protected_ports map missing from eBPF object")?,
+    )?;
+    for port in ports {
+        protected_ports.insert(port, 0u8, 0)?;
+    }
+    Ok(())
+}
+
+fn push_allow_list_to_map(
+    bpf: &mut Ebpf,
+    allow_cidrs: &HashSet<Ipv4Cidr>,
+) -> Result<(), anyhow::Error> {
+    let mut allow_map: HashMap<_, u32, u8> = HashMap::try_from(
+        bpf.map_mut(ALLOW_LIST_MAP)
+            .context("hvf_always_allow map missing from eBPF object")?,
+    )?;
+
+    let mut count: usize = 0;
+    let mut truncated = false;
+    'outer: for cidr in allow_cidrs.iter() {
+        for ip in cidr.into_iter().addresses() {
+            if count >= ALLOW_LIST_MAX_ENTRIES {
+                truncated = true;
+                break 'outer;
+            }
+            let ip_numeric: u32 = u32::from(ip);
+            allow_map.insert(ip_numeric, 0u8, 0)?;
+            count += 1;
+        }
+    }
+    if truncated {
+        warn!(
+            "Static allow list exceeds {} entries; truncated. Excess hosts will be dropped when far from leader.",
+            ALLOW_LIST_MAX_ENTRIES
+        );
+    }
+    info!(
+        "Loaded {} addresses into always-allow list (used when far from leader)",
+        count
+    );
     Ok(())
 }
 

@@ -1,9 +1,9 @@
-use aya::maps::{HashMap, Map};
+use anyhow::{anyhow, Context};
+use aya::maps::{HashMap, Map, MapData};
 use cidr::Ipv4Cidr;
 use duckdb::params;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use rangemap::RangeInclusiveSet;
-use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::ops::RangeInclusive;
@@ -15,36 +15,46 @@ use tokio::time::sleep;
 
 const DENY_LIST_SIZE: u32 = 524288;
 const DYNAMIC_LIST_BUFFER: u32 = 1024;
+const DENY_LIST_CAP: usize = (DENY_LIST_SIZE - DYNAMIC_LIST_BUFFER) as usize;
+const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct HttpDenyListClient {
     url: String,
+    client: reqwest::Client,
 }
 
 impl HttpDenyListClient {
     pub fn new(url: String) -> Self {
-        Self { url }
+        Self {
+            url,
+            client: reqwest::Client::new(),
+        }
     }
 }
 
 impl DenyListClient for HttpDenyListClient {
-    async fn get_deny_list(&self) -> Result<Vec<Ipv4Cidr>, ()> {
-        let client = reqwest::Client::new();
-        match client.get(&self.url).send().await {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    let allow_list: Vec<Ipv4Cidr> = resp.json().await.unwrap();
-                    info!(
-                        "Retrieved {} IPs from external ip service",
-                        allow_list.len()
-                    );
-                    Ok(allow_list)
-                } else {
-                    error!("Failed to decode deny list from external ip service.");
-                    Err(())
-                }
-            }
-            Err(_) => Err(()),
+    async fn get_deny_list(&self) -> anyhow::Result<Vec<Ipv4Cidr>> {
+        let resp = self
+            .client
+            .get(&self.url)
+            .send()
+            .await
+            .context("HTTP request to deny-list service failed")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "deny-list service returned non-success status: {}",
+                resp.status()
+            ));
         }
+        let deny_list: Vec<Ipv4Cidr> = resp
+            .json()
+            .await
+            .context("failed to decode deny-list JSON")?;
+        info!(
+            "Retrieved {} CIDRs from external ip service",
+            deny_list.len()
+        );
+        Ok(deny_list)
     }
 }
 
@@ -56,49 +66,54 @@ pub struct DuckDbDenyListClient {
 impl DuckDbDenyListClient {
     pub fn new(query: String) -> Self {
         Self {
-            conn: Arc::new(Mutex::new(duckdb::Connection::open_in_memory().unwrap())),
+            conn: Arc::new(Mutex::new(
+                duckdb::Connection::open_in_memory()
+                    .expect("failed to open in-memory duckdb connection"),
+            )),
             query,
         }
-    }
-
-    async fn get_deny_list(&self) -> Result<Vec<Ipv4Cidr>, ()> {
-        info!("Executing query: {}", self.query);
-
-        let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(&self.query).unwrap();
-        let mut rows = stmt.query(params![]).unwrap();
-        let mut deny_list = Vec::new();
-        let mut count = 0;
-        while let Some(row) = rows.next().unwrap() {
-            let ip: u32 = row.get(0).unwrap();
-            let converted: Ipv4Addr = ip.into();
-
-            let cidr = Ipv4Cidr::new(converted, 32).unwrap();
-            deny_list.push(cidr);
-            count += 1;
-        }
-
-        info!("Retrieved {} IPs from query", count);
-        Ok(deny_list)
     }
 }
 
 impl DenyListClient for DuckDbDenyListClient {
-    async fn get_deny_list(&self) -> Result<Vec<Ipv4Cidr>, ()> {
-        self.get_deny_list().await
+    async fn get_deny_list(&self) -> anyhow::Result<Vec<Ipv4Cidr>> {
+        info!("Executing query: {}", self.query);
+
+        let conn = self.conn.clone();
+        let query = self.query.clone();
+
+        // duckdb operations are synchronous; run them on the blocking pool so
+        // the async runtime is not stalled.
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Ipv4Cidr>> {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn.prepare(&query).context("duckdb prepare failed")?;
+            let mut rows = stmt.query(params![]).context("duckdb query failed")?;
+            let mut deny_list = Vec::new();
+            while let Some(row) = rows.next().context("duckdb row fetch failed")? {
+                let ip: u32 = row.get(0).context("duckdb row missing u32 column 0")?;
+                let converted: Ipv4Addr = ip.into();
+                let cidr = Ipv4Cidr::new(converted, 32)
+                    .context("failed to construct /32 from row value")?;
+                deny_list.push(cidr);
+            }
+            info!("Retrieved {} IPs from query", deny_list.len());
+            Ok(deny_list)
+        })
+        .await
+        .context("duckdb spawn_blocking task panicked")?
     }
 }
 
 pub struct NoOpDenyListClient;
 
 impl DenyListClient for NoOpDenyListClient {
-    async fn get_deny_list(&self) -> Result<Vec<Ipv4Cidr>, ()> {
+    async fn get_deny_list(&self) -> anyhow::Result<Vec<Ipv4Cidr>> {
         Ok(Vec::new())
     }
 }
 
 pub trait DenyListClient {
-    async fn get_deny_list(&self) -> Result<Vec<Ipv4Cidr>, ()>;
+    async fn get_deny_list(&self) -> anyhow::Result<Vec<Ipv4Cidr>>;
 }
 
 pub struct DenyListService<T: DenyListClient> {
@@ -106,122 +121,157 @@ pub struct DenyListService<T: DenyListClient> {
 }
 
 impl<T: DenyListClient> DenyListService<T> {
-    pub fn new(allow_list_client: T) -> Self {
+    pub fn new(client: T) -> Self {
         Self {
-            deny_list_client: allow_list_client,
+            deny_list_client: client,
         }
     }
 
-    pub async fn get_deny_list(&self) -> Result<Vec<Ipv4Cidr>, ()> {
+    pub async fn get_deny_list(&self) -> anyhow::Result<Vec<Ipv4Cidr>> {
         self.deny_list_client.get_deny_list().await
     }
 }
 
 pub struct DenyListStateUpdater<T: DenyListClient> {
     exit_flag: Arc<AtomicBool>,
-    allow_service: Arc<DenyListService<T>>,
-    allow_ranges: RangeInclusiveSet<u32>,
-    deny_ranges: RangeInclusiveSet<u32>,
-    deny_cidrs: Arc<HashSet<Ipv4Cidr>>,
+    deny_service: Arc<DenyListService<T>>,
+    static_allow_ranges: RangeInclusiveSet<u32>,
+    static_deny_ranges: RangeInclusiveSet<u32>,
+    static_deny_cidrs: Arc<HashSet<Ipv4Cidr>>,
 }
 
 pub fn to_range(ip: Ipv4Cidr) -> RangeInclusive<u32> {
-    let start_addr: u32 = ip.first_address().try_into().unwrap();
-    let end_addr: u32 = ip.last_address().try_into().unwrap();
+    let start_addr: u32 = ip.first_address().into();
+    let end_addr: u32 = ip.last_address().into();
     start_addr..=end_addr
 }
 
 impl<T: DenyListClient> DenyListStateUpdater<T> {
     pub fn new(
         exit_flag: Arc<AtomicBool>,
-        allow_service: Arc<DenyListService<T>>,
+        deny_service: Arc<DenyListService<T>>,
         static_overrides: Arc<(HashSet<Ipv4Cidr>, HashSet<Ipv4Cidr>)>,
     ) -> Self {
         Self {
             exit_flag,
-            allow_service,
-            allow_ranges: {
-                RangeInclusiveSet::from_iter(
-                    static_overrides.clone().0.iter().map(|ip| to_range(*ip)),
-                )
-            },
-            deny_ranges: {
-                RangeInclusiveSet::from_iter(static_overrides.1.iter().map(|ip| to_range(*ip)))
-            },
-            deny_cidrs: Arc::new(static_overrides.1.clone()),
+            deny_service,
+            static_allow_ranges: RangeInclusiveSet::from_iter(
+                static_overrides.0.iter().copied().map(to_range),
+            ),
+            static_deny_ranges: RangeInclusiveSet::from_iter(
+                static_overrides.1.iter().copied().map(to_range),
+            ),
+            static_deny_cidrs: Arc::new(static_overrides.1.clone()),
         }
     }
 
-    pub fn is_denied(&self, addr: &u32) -> bool {
-        self.deny_ranges.contains(addr)
+    pub fn is_statically_denied(&self, addr: &u32) -> bool {
+        self.static_deny_ranges.contains(addr)
     }
 
-    pub fn is_allowed(&self, addr: &u32) -> bool {
-        self.allow_ranges.contains(addr)
+    pub fn is_statically_allowed(&self, addr: &u32) -> bool {
+        self.static_allow_ranges.contains(addr)
     }
 
-    pub async fn run(&self, allow_list: Map) {
-        let mut deny_list: HashMap<_, u32, u8> = HashMap::try_from(allow_list).unwrap();
-        let mut dynamic_deny_set = HashSet::new();
-        {
-            let ips: Vec<Ipv4Addr> = self
-                .deny_cidrs
-                .iter()
-                .flat_map(|ip| ip.into_iter().addresses())
-                .collect();
-            if ips.len() > (DENY_LIST_SIZE - DYNAMIC_LIST_BUFFER) as usize {
-                error!("Deny list is too large to fit in map, static overrides will be truncated.");
-            }
-
-            for ip in ips
-                .iter()
-                .take((DENY_LIST_SIZE - DYNAMIC_LIST_BUFFER) as usize)
-            {
-                let ip_numeric: u32 = u32::from(*ip);
-                if !self.is_allowed(&ip_numeric) {
-                    deny_list.insert(ip_numeric, 0, 0).unwrap();
+    /// Seeds the BPF deny map with the expanded static-deny entries, capped at
+    /// `DENY_LIST_CAP` to leave headroom for dynamic entries.
+    fn seed_static_deny(&self, deny_map: &mut HashMap<MapData, u32, u8>) -> anyhow::Result<()> {
+        let mut count: usize = 0;
+        let mut truncated = false;
+        'outer: for cidr in self.static_deny_cidrs.iter() {
+            for ip in cidr.into_iter().addresses() {
+                if count >= DENY_LIST_CAP {
+                    truncated = true;
+                    break 'outer;
                 }
+                let ip_numeric: u32 = u32::from(ip);
+                if self.is_statically_allowed(&ip_numeric) {
+                    continue;
+                }
+                if let Err(e) = deny_map.insert(ip_numeric, 0u8, 0) {
+                    warn!("failed to seed static deny entry {ip}: {e}");
+                    continue;
+                }
+                count += 1;
             }
         }
+        if truncated {
+            error!(
+                "Static deny list exceeds {} entries; truncating. Excess hosts will not be blocked.",
+                DENY_LIST_CAP
+            );
+        }
+        info!(
+            "Seeded {} addresses into deny list from static overrides",
+            count
+        );
+        Ok(())
+    }
 
+    pub async fn run(&self, deny_map: Map) {
+        let mut deny_map: HashMap<_, u32, u8> = match HashMap::try_from(deny_map) {
+            Ok(m) => m,
+            Err(e) => {
+                error!("failed to bind deny map: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = self.seed_static_deny(&mut deny_map) {
+            error!("failed to seed static deny list: {e}");
+        }
+
+        let mut dynamic_deny_set: HashSet<u32> = HashSet::new();
         while !self.exit_flag.load(Ordering::Relaxed) {
-            if let Ok(nodes) = self.allow_service.get_deny_list().await {
-                dynamic_deny_set.clear();
-                for ip4addr in nodes.iter().flat_map(|cidr| cidr.into_iter().addresses()) {
-                    let ip_numeric: u32 = ip4addr.try_into().expect("Received invalid ip address");
-                    if !self.is_allowed(&ip_numeric) {
-                        dynamic_deny_set.insert(ip_numeric);
-                    }
+            match self.deny_service.get_deny_list().await {
+                Ok(nodes) => {
+                    self.refresh_dynamic_deny(&mut deny_map, &mut dynamic_deny_set, &nodes);
                 }
-
-                dynamic_deny_set.retain(|x| !self.is_allowed(x));
-                let to_remove = {
-                    deny_list
-                        .iter()
-                        .filter_map(|r| r.ok())
-                        .filter(|(x, _)| !dynamic_deny_set.contains(x))
-                        .filter(|(x, _)| !self.is_denied(x))
-                        .map(|x| x.0)
-                        .collect::<Vec<u32>>()
-                };
-
-                debug!("Pruning {} ips from deny list", to_remove.len());
-                for ip in to_remove {
-                    deny_list.remove(&ip).unwrap();
+                Err(e) => {
+                    error!("Error fetching deny list: {e:#}");
                 }
-
-                {
-                    for ip in dynamic_deny_set.iter() {
-                        if !deny_list.get(ip, 0).is_ok() {
-                            deny_list.insert(ip, 0, 0).unwrap();
-                        }
-                    }
-                }
-            } else {
-                error!("Error fetching deny list from RPC");
             }
+            sleep(POLL_INTERVAL).await;
+        }
+    }
 
-            sleep(Duration::from_secs(10)).await;
+    fn refresh_dynamic_deny(
+        &self,
+        deny_map: &mut HashMap<MapData, u32, u8>,
+        dynamic_deny_set: &mut HashSet<u32>,
+        nodes: &[Ipv4Cidr],
+    ) {
+        dynamic_deny_set.clear();
+        for cidr in nodes {
+            for ip4addr in cidr.into_iter().addresses() {
+                let ip_numeric: u32 = u32::from(ip4addr);
+                if !self.is_statically_allowed(&ip_numeric) {
+                    dynamic_deny_set.insert(ip_numeric);
+                }
+            }
+        }
+
+        let to_remove: Vec<u32> = deny_map
+            .iter()
+            .filter_map(Result::ok)
+            .filter(|(addr, _)| !dynamic_deny_set.contains(addr))
+            .filter(|(addr, _)| !self.is_statically_denied(addr))
+            .map(|(addr, _)| addr)
+            .collect();
+
+        debug!("Pruning {} ips from deny list", to_remove.len());
+        for ip in to_remove {
+            if let Err(e) = deny_map.remove(&ip) {
+                warn!("failed to remove {ip} from deny map: {e}");
+            }
+        }
+
+        for ip in dynamic_deny_set.iter() {
+            if deny_map.get(ip, 0).is_err() {
+                if let Err(e) = deny_map.insert(ip, 0u8, 0) {
+                    warn!("failed to insert {ip} into deny map: {e}");
+                }
+            }
         }
     }
 }
@@ -237,8 +287,8 @@ mod tests {
         let mut deny_range = RangeInclusiveSet::new();
         let single_host = Ipv4Cidr::from_str("1.1.1.1/32").unwrap();
 
-        let start_addr: u32 = single_host.first().address().try_into().unwrap();
-        let end_addr: u32 = single_host.last().address().try_into().unwrap();
+        let start_addr: u32 = single_host.first().address().into();
+        let end_addr: u32 = single_host.last().address().into();
         deny_range.insert(start_addr..=end_addr);
 
         assert!(deny_range.contains(&start_addr));
@@ -253,15 +303,50 @@ mod tests {
         let bare_host = Ipv4Cidr::from_str("192.168.1.1").unwrap();
         assert!(bare_host.is_host_address());
 
-        let start_addr: u32 = first_host.first().address().try_into().unwrap();
-        let end_addr: u32 = first_host.last().address().try_into().unwrap();
+        let start_addr: u32 = first_host.first().address().into();
+        let end_addr: u32 = first_host.last().address().into();
         deny_range.insert(start_addr..=end_addr);
 
-        let start_addr: u32 = adjacent_host.first().address().try_into().unwrap();
-        let end_addr: u32 = adjacent_host.last().address().try_into().unwrap();
+        let start_addr: u32 = adjacent_host.first().address().into();
+        let end_addr: u32 = adjacent_host.last().address().into();
         deny_range.insert(start_addr..=end_addr);
         assert_eq!(deny_range.len(), 1);
+    }
 
-        println!("{:?}", deny_range);
+    struct StaticClient {
+        nodes: Vec<Ipv4Cidr>,
+    }
+
+    impl DenyListClient for StaticClient {
+        async fn get_deny_list(&self) -> anyhow::Result<Vec<Ipv4Cidr>> {
+            Ok(self.nodes.clone())
+        }
+    }
+
+    fn cidr(s: &str) -> Ipv4Cidr {
+        Ipv4Cidr::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn static_overrides_populate_ranges() {
+        let allow: HashSet<Ipv4Cidr> = [cidr("10.0.0.1/32"), cidr("10.0.0.2/32")]
+            .into_iter()
+            .collect();
+        let deny: HashSet<Ipv4Cidr> = [cidr("192.168.0.0/30")].into_iter().collect();
+        let updater = DenyListStateUpdater::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(DenyListService::new(StaticClient { nodes: vec![] })),
+            Arc::new((allow, deny)),
+        );
+
+        let allowed: u32 = u32::from(Ipv4Addr::new(10, 0, 0, 1));
+        let not_allowed: u32 = u32::from(Ipv4Addr::new(10, 0, 0, 3));
+        let denied: u32 = u32::from(Ipv4Addr::new(192, 168, 0, 2));
+        let not_denied: u32 = u32::from(Ipv4Addr::new(192, 168, 0, 5));
+
+        assert!(updater.is_statically_allowed(&allowed));
+        assert!(!updater.is_statically_allowed(&not_allowed));
+        assert!(updater.is_statically_denied(&denied));
+        assert!(!updater.is_statically_denied(&not_denied));
     }
 }

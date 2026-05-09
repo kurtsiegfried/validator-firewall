@@ -6,34 +6,27 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-async-trait = "0.1.80"
-axum = "0.7.5"
-tower-http = { version = "0.5.2", features = ["validate-request", "auth"] }
-aya = "0.12"
+async-trait = "0.1"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["validate-request", "auth"] }
+aya = "0.13"
 aya-log = "0.2"
-cadence = "1.4.0"
-cidr = { version = "0.2", features = ["serde"] }
-clap = { version = "4.1", features = ["derive"] }
-env_logger = "0.11"
+cidr = { version = "0.3", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
 log = "0.4"
-rangemap = "1.5.1"
+rangemap = "1.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = { version = "0.9" }
-solana-rpc-client = "1.18.15"
-solana-sdk = "1.18.15"
-tokio = { version = "1.25", features = ["macros", "rt", "rt-multi-thread", "net", "signal"] }
-tracing = "0.1.40"
-tracing-subscriber = { version = "0.3.18", features = [
-    "json",
-    "env-filter",
-    "ansi",
-] }
+serde_json = "1.0"
+solana-rpc-client = "2"
+solana-sdk = "2"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "ansi"] }
 validator-firewall-common = { path = "../validator-firewall-common", features = ["user"] }
-serde_json = "1.0.117"
-hyper = "0.14.28"
-reqwest = "0.11.27"
-duckdb = { version="1.0.0", features=["bundled"]}
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+duckdb = { version = "1", features = ["bundled"] }
 
 [[bin]]
 name = "validator-firewall"

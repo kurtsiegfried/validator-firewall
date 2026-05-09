@@ -32,7 +32,10 @@ impl StatsService {
         let mut pairs: Vec<(Ipv4Addr, u64)> = map
             .filter_map(|res| res.ok())
             .map(|(addr, per_cpu)| {
-                let parsed_addr = std::net::Ipv4Addr::from(u32::from_ne_bytes(addr.to_ne_bytes()));
+                // The eBPF program stores source addresses as host-order u32
+                // (via `u32::from_be(src_addr)`), so to render dotted-quad we
+                // reinterpret those octets as big-endian.
+                let parsed_addr = Ipv4Addr::from(addr.to_be_bytes());
 
                 (
                     parsed_addr,
@@ -74,8 +77,8 @@ impl StatsService {
                 }
             }
 
-            let rate = (all_sum - all_last_sum) / all_las_eval_time.elapsed().as_secs().max(1);
-            let delta = all_sum - all_last_sum;
+            let delta = all_sum.saturating_sub(all_last_sum);
+            let rate = delta / all_las_eval_time.elapsed().as_secs().max(1);
 
             info!(
                 traffic_type = "All",
@@ -100,9 +103,8 @@ impl StatsService {
                 }
             }
 
-            let rate =
-                (blocked_sum - blocked_last_sum) / blocked_las_eval_time.elapsed().as_secs().max(1);
-            let delta = blocked_sum - blocked_last_sum;
+            let delta = blocked_sum.saturating_sub(blocked_last_sum);
+            let rate = delta / blocked_las_eval_time.elapsed().as_secs().max(1);
             info!(
                 traffic_type = "Blocked",
                 rate = rate,
