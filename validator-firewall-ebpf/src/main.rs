@@ -4,12 +4,12 @@
 use aya_ebpf::{
     bindings::xdp_action,
     macros::{map, xdp},
-    maps::{Array, HashMap, PerCpuHashMap},
+    maps::{lpm_trie::Key as LpmKey, Array, HashMap, LpmTrie, PerCpuHashMap},
     programs::XdpContext,
 };
 use aya_log_ebpf::{debug, error, warn};
 
-use validator_firewall_common::{RuntimeControls,ConnectionStats,StatType};
+use validator_firewall_common::{ConnectionStats, RuntimeControls, StatType};
 
 use core::mem;
 use network_types::{
@@ -19,6 +19,7 @@ use network_types::{
 };
 
 const DENY_LIST_SIZE: u32 = 524288;
+const ALLOW_LPM_SIZE: u32 = 1024;
 
 // BPF maps shared with userspace.
 //
@@ -34,8 +35,17 @@ const DENY_LIST_SIZE: u32 = 524288;
 #[map(name = "hvf_deny_list")]
 static LEADER_SLOT_DENY_LIST: HashMap<u32, u8> =
     HashMap::<u32, u8>::with_max_entries(DENY_LIST_SIZE, 0);
-#[map(name = "hvf_always_allow")]
-static FULL_SCHEDULE_ALLOW_LIST: HashMap<u32, u8> = HashMap::<u32, u8>::with_max_entries(8192, 0);
+
+// `hvf_always_allow_lpm` deviates from the host-order convention above:
+// LPM-trie keys MUST be stored in NETWORK byte order (`Ipv4Addr::octets()` /
+// `(*ipv4_hdr).src_addr`), because the kernel walks bits MSB-first byte-0-
+// first when matching. Feeding host-order bytes here silently makes a /16
+// for `8.8.0.0` match packets from `0.0.x.x` instead — which is what bit us
+// the last time we tried this. See REVIEW_NOTES.md M6 for the full write-up.
+#[map(name = "hvf_always_allow_lpm")]
+static FULL_SCHEDULE_ALLOW_LPM: LpmTrie<[u8; 4], u8> =
+    LpmTrie::<[u8; 4], u8>::with_max_entries(ALLOW_LPM_SIZE, 0);
+
 #[map(name = "hvf_stats")]
 static STATS: PerCpuHashMap<u32, ConnectionStats> =
     PerCpuHashMap::<u32, ConnectionStats>::with_max_entries(16384, 0);
@@ -76,13 +86,16 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 //Hide some unsafe blocks
 #[inline(always)]
-fn is_allowed(address: u32, close_to_leader: bool) -> bool {
-    return if close_to_leader {
+fn is_allowed(address: u32, src_bytes: [u8; 4], close_to_leader: bool) -> bool {
+    if close_to_leader {
+        // Deny list is a regular HashMap keyed by host-order u32.
         unsafe { LEADER_SLOT_DENY_LIST.get(&address).is_none() }
     } else {
-        unsafe { FULL_SCHEDULE_ALLOW_LIST.get(&address).is_some() }
+        // Allow list is an LPM trie keyed by NETWORK-order src_bytes; pass
+        // the packet's src_addr through directly (it's already big-endian).
+        let key = LpmKey::<[u8; 4]>::new(32, src_bytes);
+        FULL_SCHEDULE_ALLOW_LPM.get(&key).is_some()
     }
-
 }
 
 #[inline(always)]
@@ -150,7 +163,13 @@ fn try_process_packet(ctx: &XdpContext, close_to_leader: bool) -> Result<u32, ()
     let ipv4_header: *const Ipv4Hdr = ptr_at(ctx, EthHdr::LEN)?;
     let proto = unsafe { (*ipv4_header).proto };
     if proto == IpProto::Udp as u8 {
-        let source_addr = u32::from_be_bytes(unsafe { (*ipv4_header).src_addr });
+        // Two views of the source IP, kept in sync:
+        //  - src_bytes:   network-order [a, b, c, d], fed straight to the LPM
+        //                 trie key (kernel matches MSB-first, byte-0-first).
+        //  - source_addr: host-order u32, used for the host-order HashMap
+        //                 keys (deny list, stats) and aya-log's {:i} renderer.
+        let src_bytes = unsafe { (*ipv4_header).src_addr };
+        let source_addr = u32::from_be_bytes(src_bytes);
         let udp_header: *const UdpHdr = ptr_at(ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
         let dest_port = u16::from_be_bytes(unsafe { (*udp_header).dst });
         if !is_protected_port(dest_port) {
@@ -165,7 +184,7 @@ fn try_process_packet(ctx: &XdpContext, close_to_leader: bool) -> Result<u32, ()
         if is_quic_zero_rtt(ctx, source_addr) {
             increment_counter(ctx, source_addr, StatType::ZeroRtt);
         }
-        let action = if is_allowed(source_addr, close_to_leader) {
+        let action = if is_allowed(source_addr, src_bytes, close_to_leader) {
             debug!(
                 ctx,
                 "ALLOW SRC IP: {:i}, DEST PORT: {}",

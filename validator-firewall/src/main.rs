@@ -13,7 +13,7 @@ use crate::leader_tracker::{CommandControlService, RPCLeaderTracker};
 use anyhow::Context;
 use aya::{
     include_bytes_aligned,
-    maps::HashMap,
+    maps::{lpm_trie::Key as LpmKey, HashMap, LpmTrie},
     programs::{Xdp, XdpFlags},
     Ebpf,
 };
@@ -47,13 +47,13 @@ struct HVFConfig {
 }
 
 const DENY_LIST_MAP: &str = "hvf_deny_list";
-const ALLOW_LIST_MAP: &str = "hvf_always_allow";
+const ALLOW_LIST_LPM_MAP: &str = "hvf_always_allow_lpm";
 const PROTECTED_PORTS_MAP: &str = "hvf_protected_ports";
 const CONNECTION_STATS: &str = "hvf_stats";
 const CNC_ARRAY: &str = "hvf_cnc";
 
-// Must match validator-firewall-ebpf hvf_always_allow max_entries.
-const ALLOW_LIST_MAX_ENTRIES: usize = 8192;
+// Must match validator-firewall-ebpf ALLOW_LPM_SIZE.
+const ALLOW_LPM_MAX_ENTRIES: usize = 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -271,32 +271,38 @@ fn push_allow_list_to_map(
     bpf: &mut Ebpf,
     allow_cidrs: &HashSet<Ipv4Cidr>,
 ) -> Result<(), anyhow::Error> {
-    let mut allow_map: HashMap<_, u32, u8> = HashMap::try_from(
-        bpf.map_mut(ALLOW_LIST_MAP)
-            .context("hvf_always_allow map missing from eBPF object")?,
+    // hvf_always_allow_lpm is an LPM trie keyed by NETWORK-order [u8; 4]; the
+    // kernel matches bits MSB-first byte-0-first, so feeding host-order bytes
+    // here would silently reverse-match prefixes. Use Ipv4Addr::octets() —
+    // it always returns [a, b, c, d] in network order regardless of host
+    // endianness. (See REVIEW_NOTES.md M6 / commit message.)
+    let mut allow_map: LpmTrie<_, [u8; 4], u8> = LpmTrie::try_from(
+        bpf.map_mut(ALLOW_LIST_LPM_MAP)
+            .context("hvf_always_allow_lpm map missing from eBPF object")?,
     )?;
 
     let mut count: usize = 0;
     let mut truncated = false;
-    'outer: for cidr in allow_cidrs.iter() {
-        for ip in cidr.into_iter().addresses() {
-            if count >= ALLOW_LIST_MAX_ENTRIES {
-                truncated = true;
-                break 'outer;
-            }
-            let ip_numeric: u32 = u32::from(ip);
-            allow_map.insert(ip_numeric, 0u8, 0)?;
-            count += 1;
+    for cidr in allow_cidrs.iter() {
+        if count >= ALLOW_LPM_MAX_ENTRIES {
+            truncated = true;
+            break;
         }
+        let key = LpmKey::<[u8; 4]>::new(
+            u32::from(cidr.network_length()),
+            cidr.first_address().octets(),
+        );
+        allow_map.insert(&key, 0u8, 0)?;
+        count += 1;
     }
     if truncated {
         warn!(
-            "Static allow list exceeds {} entries; truncated. Excess hosts will be dropped when far from leader.",
-            ALLOW_LIST_MAX_ENTRIES
+            "Static allow list exceeds {} CIDRs; truncated. Excess prefixes will be dropped when far from leader.",
+            ALLOW_LPM_MAX_ENTRIES
         );
     }
     info!(
-        "Loaded {} addresses into always-allow list (used when far from leader)",
+        "Loaded {} CIDRs into always-allow LPM trie (used when far from leader)",
         count
     );
     Ok(())
