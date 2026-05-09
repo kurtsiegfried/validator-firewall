@@ -148,19 +148,24 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
 
 #[inline(always)]
 fn try_process_packet(ctx: &XdpContext, close_to_leader: bool) -> Result<u32, ()> {
-    // network-types 0.2 stores raw u8/u16 fields in network byte order; we
-    // compare against the protocol-enum variants cast to their wire values
-    // (avoids the Result-returning helper which the verifier doesn't like).
+    // network-types 0.2 stores raw u8/u16 fields in network byte order, AND
+    // its EtherType / IpProto enum variants are pre-swapped to wire order
+    // (variants defined as `0x0800_u16.to_be()` etc.). So we compare against
+    // the on-wire u16 directly, *without* a `u16::from_be` round-trip. Doing
+    // a from_be here would double-swap and silently misclassify every IPv4
+    // packet as "unknown" — the protected-port path is then never entered
+    // and the stats map stays empty (we hit this exact bug at 0.0.5 → 0.2.0).
     let eth_header: *const EthHdr = ptr_at(ctx, 0)?;
-    let ether_type = u16::from_be(unsafe { (*eth_header).ether_type });
-    if ether_type == EtherType::Ipv6 as u16 {
+    let ether_type_wire = unsafe { (*eth_header).ether_type };
+    if ether_type_wire == EtherType::Ipv6 as u16 {
         return Ok(xdp_action::XDP_PASS);
     }
-    if ether_type != EtherType::Ipv4 as u16 {
+    if ether_type_wire != EtherType::Ipv4 as u16 {
         return Ok(xdp_action::XDP_PASS);
     }
 
     let ipv4_header: *const Ipv4Hdr = ptr_at(ctx, EthHdr::LEN)?;
+    // IpProto is a single u8, no endianness — compare directly.
     let proto = unsafe { (*ipv4_header).proto };
     if proto == IpProto::Udp as u8 {
         // Two views of the source IP, kept in sync:

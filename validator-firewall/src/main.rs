@@ -44,6 +44,11 @@ struct HVFConfig {
     external_ip_service_url: Option<String>,
     #[clap(short, long)]
     query_file: Option<PathBuf>,
+    /// DEBUG ONLY: skip the RPC leader tracker and pin the firewall to
+    /// "far from leader" mode. Used to exercise the LPM-allow datapath in
+    /// isolation. Do not use in production.
+    #[clap(long)]
+    debug_force_far_from_leader: bool,
 }
 
 const DENY_LIST_MAP: &str = "hvf_deny_list";
@@ -133,8 +138,23 @@ async fn main() -> Result<(), anyhow::Error> {
         .context("eBPF program 'validator_firewall' missing from object")?
         .try_into()?;
     program.load()?;
-    program.attach(&config.iface, XdpFlags::default())
-        .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
+    // Try native XDP first; fall back to SKB mode on EINVAL. Native is
+    // refused by some drivers when the interface has jumbo MTU or when the
+    // driver lacks a native XDP path (mlx5_core with MTU 9000 + multi-buffer
+    // XDP not enabled is a common case). SKB mode runs the same program
+    // after packet→skb conversion, so the matching logic is identical.
+    if let Err(native_err) = program.attach(&config.iface, XdpFlags::default()) {
+        warn!(
+            "native XDP attach on {} failed ({}); retrying in SKB mode",
+            &config.iface, native_err
+        );
+        program
+            .attach(&config.iface, XdpFlags::SKB_MODE)
+            .context("XDP attach failed in both native and SKB mode")?;
+        info!("XDP attached on {} in SKB mode", &config.iface);
+    } else {
+        info!("XDP attached on {} in native mode", &config.iface);
+    }
 
     info!("Filtering UDP ports: {:?}", protected_ports);
     push_ports_to_map(&mut bpf, protected_ports)?;
@@ -197,25 +217,47 @@ async fn main() -> Result<(), anyhow::Error> {
         gossip_handle
     };
 
-    //Start the leader tracker
-    let tracker = Arc::new(RPCLeaderTracker::new(
-        exit.clone(),
-        RpcClient::new(config.rpc_endpoint.clone()),
-        12,
-        config.leader_id,
-    ));
-    let bg_tracker = tracker.clone();
-    let tracker_handle = tokio::spawn(async move {
-        bg_tracker.clone().run().await;
-    });
-
     let cnc_map = bpf
         .take_map(CNC_ARRAY)
         .context("hvf_cnc map missing from eBPF object")?;
-    let mut tracker_service = CommandControlService::new(exit.clone(), tracker, cnc_map);
-    let tracker_service_handle = tokio::spawn(async move {
-        tracker_service.run().await;
-    });
+
+    // Either run the live leader tracker or pin the CnC to a debug mode.
+    let (tracker_handle, tracker_service_handle) = if config.debug_force_far_from_leader {
+        warn!(
+            "--debug-force-far-from-leader: skipping RPC leader tracker; \
+             pinning close_to_leader=false (LPM-allow datapath only)"
+        );
+        let mut cnc: aya::maps::Array<_, validator_firewall_common::RuntimeControls> =
+            aya::maps::Array::try_from(cnc_map)?;
+        cnc.set(
+            0,
+            validator_firewall_common::RuntimeControls {
+                global_enabled: true,
+                close_to_leader: false,
+            },
+            0,
+        )?;
+        // Spawn no-op tasks so the join shape downstream is unchanged.
+        let noop_a = tokio::spawn(async {});
+        let noop_b = tokio::spawn(async {});
+        (noop_a, noop_b)
+    } else {
+        let tracker = Arc::new(RPCLeaderTracker::new(
+            exit.clone(),
+            RpcClient::new(config.rpc_endpoint.clone()),
+            12,
+            config.leader_id,
+        ));
+        let bg_tracker = tracker.clone();
+        let tracker_handle = tokio::spawn(async move {
+            bg_tracker.clone().run().await;
+        });
+        let mut tracker_service = CommandControlService::new(exit.clone(), tracker, cnc_map);
+        let tracker_service_handle = tokio::spawn(async move {
+            tracker_service.run().await;
+        });
+        (tracker_handle, tracker_service_handle)
+    };
 
     //Start the stats service
     let stats_exit = exit.clone();
